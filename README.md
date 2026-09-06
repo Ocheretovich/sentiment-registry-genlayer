@@ -2,7 +2,7 @@
 
 A minimal Intelligent Contract that classifies the sentiment of user-submitted
 text (positive / negative / neutral) using an LLM, with validator consensus
-handled entirely by GenLayer's built-in `gl.eq_principle.prompt_non_comparative`
+handled entirely by GenLayer's built-in `gl.eq_principle.prompt_comparative`
 helper.
 
 ## Why it's built this way
@@ -38,9 +38,9 @@ later. That's a deliberate simplification, not an oversight.
 
 ## Contract
 
-Deployed on GenLayer Studionet: `0x0aF7c1BaCC0F9403e0070C6E48192304e87bF80f`
+Deployed on GenLayer Studionet: `0x45d4bF8426715e0A73fA81b22D9Aba0EAd4E5dcB`
 
-Open directly in Studio: https://studio.genlayer.com/?import-contract=0x0aF7c1BaCC0F9403e0070C6E48192304e87bF80f
+Open directly in Studio: https://studio.genlayer.com/?import-contract=0x45d4bF8426715e0A73fA81b22D9Aba0EAd4E5dcB
 
 ### Methods
 
