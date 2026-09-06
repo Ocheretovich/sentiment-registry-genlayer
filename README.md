@@ -8,11 +8,22 @@ helper.
 ## Why it's built this way
 
 Most Intelligent Contract examples reach consensus with a hand-written
-`leader_fn` / `validator_fn` pair. This contract deliberately avoids that:
+`leader_fn` / `validator_fn` pair. This contract avoids that, using
+GenLayer's built-in equivalence helpers instead — with one important
+correction from an earlier version:
 
-- **No custom validator logic** — `prompt_non_comparative` handles the
-  leader/validator agreement internally, so there's no comparison code that
-  could be written incorrectly.
+- **Validators independently classify the text, not just check its format.**
+  An earlier version used `gl.eq_principle.prompt_non_comparative` with
+  criteria that only verified the leader's answer was one of three allowed
+  words ("positive", "negative", "neutral") — it never checked that the
+  chosen word actually matched what the text said. A leader could have
+  returned "positive" for a clearly negative review and every validator
+  would have accepted it, since nothing tied the label to the input.
+  This version uses `gl.eq_principle.prompt_comparative` instead: each
+  validator re-runs the same classification prompt on the same submitted
+  text themselves, and an NLP judge only accepts the result if their
+  independently-derived label matches the leader's. Agreement now requires
+  genuinely classifying the same text the same way.
 - **No web fetch** — the input is passed directly by the caller, so there's
   no dependency on an external page being reachable or unchanged.
 - **No multi-stage state machine** — each submission is classified once and
