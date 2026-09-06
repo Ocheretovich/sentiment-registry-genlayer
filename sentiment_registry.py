@@ -17,13 +17,21 @@ class SentimentRegistry(gl.Contract):
     A deliberately minimal Intelligent Contract, built to keep the bug
     surface as small as possible:
 
-    - One write method, one LLM call.
-    - Uses GenLayer's built-in `gl.eq_principle.prompt_non_comparative`
-      helper for consensus, instead of a hand-written leader_fn/validator_fn
-      pair. The leader calls the LLM once; every other validator checks
-      the leader's answer against the `criteria` text — they don't need
-      to independently re-derive and compare a result, so there's no
-      custom comparison logic that can be written incorrectly.
+    - One write method, one LLM call per validator.
+    - Uses GenLayer's built-in `gl.eq_principle.prompt_comparative` helper
+      for consensus. Each validator independently re-runs the same
+      classification prompt on the *same submitted text* and an NLP judge
+      checks that their result matches the leader's under `principle`.
+      This is important: an earlier version of this contract used
+      `prompt_non_comparative` with criteria that only checked the
+      leader's answer was one of three allowed words — it never verified
+      that the chosen word actually matched the sentiment of the text.
+      A leader could have returned "positive" for a negative text and
+      validators would have accepted it, since nothing tied the label to
+      the input. `prompt_comparative` fixes this by having every
+      validator independently derive their own label from the same text,
+      so agreement can only happen if they'd genuinely classify it the
+      same way.
     - No web fetch (gl.nondet.web.get), so no dependency on an external
       page being reachable or unchanged.
     - No multi-stage state machine (pending/resolved/finalized/disputed).
@@ -49,19 +57,25 @@ class SentimentRegistry(gl.Contract):
         if not text.strip():
             raise gl.vm.UserError("Feedback text cannot be empty")
 
-        def get_input() -> str:
-            return text
+        def classify() -> str:
+            # Each validator runs this itself, independently, on the same
+            # `text` — the label they arrive at is what gets compared
+            # against the leader's, not just format-checked.
+            response = gl.nondet.exec_prompt(
+                "Classify the sentiment of the following text. "
+                "Respond with exactly one word: positive, negative, or neutral. "
+                "No punctuation, no extra words, no explanation.\n\n"
+                f"TEXT:\n{text}"
+            )
+            return response.strip().lower().strip(".")
 
-        raw_sentiment = gl.eq_principle.prompt_non_comparative(
-            get_input,
-            task=(
-                "Classify the sentiment of the given text. "
-                "Respond with exactly one word: positive, negative, or neutral."
+        raw_sentiment = gl.eq_principle.prompt_comparative(
+            classify,
+            principle=(
+                "The result is exactly one of: positive, negative, neutral. "
+                "It correctly reflects the sentiment actually expressed in the "
+                "submitted text — not just any one of the three allowed words."
             ),
-            criteria="""
-                The response is exactly one of the words: positive, negative, neutral
-                No punctuation, no extra words, no explanation
-            """,
         )
 
         # Defensive normalization: even with a tight `criteria`, an LLM can
