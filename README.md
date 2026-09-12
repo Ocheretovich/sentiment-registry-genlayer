@@ -69,9 +69,9 @@ Other deliberate choices:
 
 ## Contract
 
-Deployed on GenLayer Studionet: `<fill in after deploying>`
+Deployed on GenLayer Studionet: `0x318E8484545029200E081D50408aC954D8cF9289`
 
-Open directly in Studio: `https://studio.genlayer.com/?import-contract=<address>`
+Open directly in Studio: `https://studio.genlayer.com/?import-contract=0x318E8484545029200E081D50408aC954D8cF9289`
 
 ### Constructor
 
