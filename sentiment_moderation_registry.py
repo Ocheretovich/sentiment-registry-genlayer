@@ -7,48 +7,66 @@ import typing
 
 @allow_storage
 @dataclass
-class Feedback:
+class Case:
     text: str
-    sentiment: str  # "positive" | "negative" | "neutral" — validated by consensus
-    decision: str    # policy-derived outcome, e.g. "accepted" | "review" | "flagged"
+    sentiment: str      # "positive" | "negative" | "neutral" — currently validated label
+    decision: str        # policy-derived outcome, e.g. "accepted" | "review" | "flagged"
+    status: str          # "provisional" | "confirmed" | "disputed"
+    resolutions: u32      # how many independent classification rounds this case has been through
+    confirmations: u32    # consecutive rounds in a row that agreed on the same sentiment
 
 
 class SentimentModerationRegistry(gl.Contract):
     """
-    A consensus-validated feedback moderation registry.
-
-    Each submission is classified by sentiment through GenLayer's validator
-    consensus: every validator independently re-classifies the same text
-    (gl.eq_principle.prompt_comparative), and agreement is checked against
-    the actual content of the text, not just the format of the answer.
-
-    That validated sentiment is not the end of the story — it's fed into a
-    configurable, fully deterministic policy (set once at deploy time) that
-    turns it into a moderation decision, and both the sentiment and the
-    decision update running aggregate counters:
+    A consensus-validated feedback moderation registry with a real
+    review/challenge lifecycle.
 
         submitted text
-              -> independent comparative classification (consensus)
+              -> independent comparative classification (validator consensus)
               -> validated sentiment
               -> configurable policy rule
-              -> stored moderation decision
-              -> aggregate counters
+              -> stored decision, status = "provisional"
 
-    Deployers choose what each sentiment means for their use case — e.g.
-    positive -> "accepted", neutral -> "review", negative -> "flagged" for
-    a support-feedback triage queue, or a different mapping entirely for a
-    different domain. The sentiment doesn't just get stored; it determines
-    what happens next.
+        anyone can challenge_case(id) at any time:
+              -> the same text is independently re-classified through
+                 consensus, from scratch
+              -> if the new sentiment agrees with the current one:
+                    confirmations += 1
+                    status -> "confirmed" once confirmations reach 2
+              -> if it disagrees:
+                    sentiment and decision are replaced with the new,
+                    validated result
+                    confirmations reset to 1
+                    status -> "disputed"
 
-    On invalid model output: an earlier version of this contract silently
-    coerced any unrecognized response into "neutral". That's a masked
-    failure, not a handled one — it would hide exactly the kind of
-    disagreement this contract exists to catch. This version fails the
-    transaction instead if validator consensus doesn't land on one of the
-    three known sentiment labels.
+    This is a deliberate design choice: a single classification is
+    provisional, not authoritative. A case only becomes "confirmed" once
+    two independent rounds in a row agree, and a disagreement doesn't get
+    silently ignored — it overturns the stored decision and is recorded
+    as a dispute. The lifecycle transitions are explicit and the outcome
+    (decision) is recomputed from whatever sentiment is currently valid,
+    not fixed at submission time.
+
+    Earlier versions of this contract:
+    - classified text and stored the label with no consequence beyond
+      storage (fixed by adding the decision policy below);
+    - used `gl.eq_principle.prompt_non_comparative` with format-only
+      criteria, so validators never actually checked the label against
+      the text (fixed by switching to `prompt_comparative`, where every
+      validator independently re-derives the label);
+    - used an overly convoluted `principle` wording ("not just any one of
+      the three allowed words") that made the automatic equivalence judge
+      too strict, causing honest agreement to be misread as disagreement
+      (fixed by simplifying the wording to a direct positive statement).
+
+    On invalid model output: if validator consensus doesn't land on one
+    of the three known sentiment labels, the transaction reverts. An
+    unrecognized result is never silently coerced into a default label —
+    that would mask exactly the kind of disagreement this contract exists
+    to catch.
     """
 
-    feedback: TreeMap[u32, Feedback]
+    cases: TreeMap[u32, Case]
     next_id: u32
 
     # Configurable policy, set once at deploy time.
@@ -56,10 +74,18 @@ class SentimentModerationRegistry(gl.Contract):
     neutral_decision: str
     negative_decision: str
 
-    # Aggregate counters, updated on every submission.
-    positive_count: u32
-    neutral_count: u32
-    negative_count: u32
+    # Cumulative counters. These are monotonic — they count how many
+    # classification rounds and lifecycle transitions have happened in
+    # total, not a live snapshot of current case states. That keeps the
+    # bookkeeping simple: every counter here only ever increments, so
+    # there's no decrement/rebalance logic that could drift out of sync
+    # with the actual case data.
+    total_classifications: u32
+    positive_classifications: u32
+    negative_classifications: u32
+    neutral_classifications: u32
+    confirmed_events: u32
+    disputed_events: u32
 
     def __init__(
         self,
@@ -71,24 +97,31 @@ class SentimentModerationRegistry(gl.Contract):
         self.positive_decision = positive_decision
         self.neutral_decision = neutral_decision
         self.negative_decision = negative_decision
-        self.positive_count = u32(0)
-        self.neutral_count = u32(0)
-        self.negative_count = u32(0)
 
-    @gl.public.write
-    def submit_feedback(self, text: str) -> u32:
+        self.total_classifications = u32(0)
+        self.positive_classifications = u32(0)
+        self.negative_classifications = u32(0)
+        self.neutral_classifications = u32(0)
+        self.confirmed_events = u32(0)
+        self.disputed_events = u32(0)
+
+    def _policy_for(self, sentiment: str) -> str:
+        if sentiment == "positive":
+            return self.positive_decision
+        if sentiment == "negative":
+            return self.negative_decision
+        return self.neutral_decision  # sentiment == "neutral"
+
+    def _classify_text(self, text: str) -> str:
         """
-        Classifies `text` via validator consensus, applies the deploy-time
-        policy to derive a moderation decision, stores both, and updates
-        the aggregate counters. Returns the new entry's id.
+        Runs one independent, consensus-validated classification round on
+        `text` and updates the cumulative classification counters. Used
+        by both submit_case (the first round) and challenge_case (every
+        subsequent round) so both paths go through identical, tested
+        logic.
         """
-        if not text.strip():
-            raise gl.vm.UserError("Feedback text cannot be empty")
 
         def classify() -> str:
-            # Each validator runs this itself, independently, on the same
-            # `text` — the label they arrive at is what gets compared
-            # against the leader's, not just format-checked.
             response = gl.nondet.exec_prompt(
                 "Classify the sentiment of the following text. "
                 "Respond with exactly one word: positive, negative, or neutral. "
@@ -107,37 +140,100 @@ class SentimentModerationRegistry(gl.Contract):
 
         sentiment = raw_sentiment.strip().lower().strip(".")
         if sentiment not in ("positive", "negative", "neutral"):
-            # Consensus was reached on *something*, but it isn't one of the
-            # three labels this contract knows how to act on. Fail loudly
-            # rather than silently defaulting to a safe-looking value.
             raise gl.vm.UserError(
                 f"Validated sentiment '{raw_sentiment}' is not a recognized label"
             )
 
+        self.total_classifications = u32(self.total_classifications + 1)
         if sentiment == "positive":
-            decision = self.positive_decision
-            self.positive_count = u32(self.positive_count + 1)
+            self.positive_classifications = u32(self.positive_classifications + 1)
         elif sentiment == "negative":
-            decision = self.negative_decision
-            self.negative_count = u32(self.negative_count + 1)
+            self.negative_classifications = u32(self.negative_classifications + 1)
         else:
-            decision = self.neutral_decision
-            self.neutral_count = u32(self.neutral_count + 1)
+            self.neutral_classifications = u32(self.neutral_classifications + 1)
 
-        feedback_id = self.next_id
-        self.feedback[feedback_id] = Feedback(text=text, sentiment=sentiment, decision=decision)
+        return sentiment
+
+    @gl.public.write
+    def submit_case(self, text: str) -> u32:
+        """
+        Classifies `text` via validator consensus, applies the deploy-time
+        policy to derive an initial decision, and stores the case in
+        "provisional" status. Returns the new case's id.
+        """
+        if not text.strip():
+            raise gl.vm.UserError("Case text cannot be empty")
+
+        sentiment = self._classify_text(text)
+        decision = self._policy_for(sentiment)
+
+        case_id = self.next_id
+        self.cases[case_id] = Case(
+            text=text,
+            sentiment=sentiment,
+            decision=decision,
+            status="provisional",
+            resolutions=u32(1),
+            confirmations=u32(1),
+        )
         self.next_id = u32(self.next_id + 1)
-        return feedback_id
+        return case_id
+
+    @gl.public.write
+    def challenge_case(self, case_id: u32) -> typing.Any:
+        """
+        Re-runs an independent, consensus-validated classification of the
+        case's stored text. If it agrees with the current sentiment, the
+        case moves toward "confirmed"; if it disagrees, the sentiment and
+        decision are replaced and the case becomes "disputed". Returns the
+        case's state after the challenge.
+        """
+        if case_id not in self.cases:
+            raise gl.vm.UserError("Unknown case id")
+
+        case = self.cases[case_id]
+        new_sentiment = self._classify_text(case.text)
+        case.resolutions = u32(case.resolutions + 1)
+
+        if new_sentiment == case.sentiment:
+            case.confirmations = u32(case.confirmations + 1)
+            if case.confirmations >= u32(2):
+                if case.status != "confirmed":
+                    self.confirmed_events = u32(self.confirmed_events + 1)
+                case.status = "confirmed"
+        else:
+            case.sentiment = new_sentiment
+            case.decision = self._policy_for(new_sentiment)
+            case.confirmations = u32(1)
+            case.status = "disputed"
+            self.disputed_events = u32(self.disputed_events + 1)
+
+        self.cases[case_id] = case
+        return {
+            "case_id": case_id,
+            "sentiment": case.sentiment,
+            "decision": case.decision,
+            "status": case.status,
+            "resolutions": case.resolutions,
+            "confirmations": case.confirmations,
+        }
 
     @gl.public.view
-    def get_feedback(self, feedback_id: u32) -> typing.Any:
-        if feedback_id not in self.feedback:
-            raise gl.vm.UserError("Unknown feedback id")
-        f = self.feedback[feedback_id]
-        return {"text": f.text, "sentiment": f.sentiment, "decision": f.decision}
+    def get_case(self, case_id: u32) -> typing.Any:
+        if case_id not in self.cases:
+            raise gl.vm.UserError("Unknown case id")
+        c = self.cases[case_id]
+        return {
+            "text": c.text,
+            "sentiment": c.sentiment,
+            "decision": c.decision,
+            "status": c.status,
+            "resolutions": c.resolutions,
+            "confirmations": c.confirmations,
+        }
 
     @gl.public.view
-    def total_feedback(self) -> u32:
+    def total_cases(self) -> u32:
         return self.next_id
 
     @gl.public.view
@@ -151,8 +247,11 @@ class SentimentModerationRegistry(gl.Contract):
     @gl.public.view
     def get_stats(self) -> typing.Any:
         return {
-            "total": self.next_id,
-            "positive_count": self.positive_count,
-            "neutral_count": self.neutral_count,
-            "negative_count": self.negative_count,
+            "total_cases": self.next_id,
+            "total_classifications": self.total_classifications,
+            "positive_classifications": self.positive_classifications,
+            "negative_classifications": self.negative_classifications,
+            "neutral_classifications": self.neutral_classifications,
+            "confirmed_events": self.confirmed_events,
+            "disputed_events": self.disputed_events,
         }
